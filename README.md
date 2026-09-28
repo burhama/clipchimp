@@ -20,6 +20,8 @@ For Windows.
 
 Pen, marker, eraser, box, circle, arrow, line, text and crop. Undo and redo too.
 
+Scroll to zoom. Right-drag to move it.
+
 ### 4. Click anywhere outside it.
 
 ![Step 4: click outside to save and copy](docs/step-4.png)

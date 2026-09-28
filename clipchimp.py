@@ -10,12 +10,13 @@ import logging
 import math
 import os
 from pathlib import Path
+import struct
 import tempfile
 import threading
 import time
 import winreg
 
-from PIL import Image, ImageDraw, ImageFont, ImageGrab, ImageTk
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageGrab, ImageTk
 import tkinter as tk
 from tkinter import colorchooser, simpledialog
 import win32clipboard
@@ -48,6 +49,10 @@ WS_EX_NOACTIVATE = 0x08000000
 SWP_SHOWWINDOW = 0x0040
 HWND_TOPMOST = -1
 TRANSPARENT_KEY = "#ff00ff"
+ZOOM_STEP = 1.25            # one wheel notch
+ZOOM_MIN, ZOOM_MAX = 0.2, 8.0
+ZOOM_MAX_PIXELS = 12_000_000  # the zoomed frame never grows past this many pixels (keeps every redraw quick)
+ZOOM_MIN_SIDE = 24          # nor shrinks below this many pixels a side
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -483,6 +488,94 @@ def load_icon(name: str, colour: str) -> Image.Image:
         return fallback_icon(name, colour)
 
 
+CURSOR_INK = "#1f2328"
+TIP_TOOLS = ("pen", "highlighter")          # hotspot = the writing tip of the icon
+CENTRE_TOOLS = ("eraser",)                  # hotspot = the middle of the icon
+# every other tool needs an exact point: a small crosshair marks it and the icon sits beside it
+
+
+def cursor_art(name: str) -> tuple[Image.Image, Point]:
+    """The tool's icon as a 32x32 cursor image (ink with a white outline) and its hotspot."""
+    size = 32
+    ink = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    if name in TIP_TOOLS or name in CENTRE_TOOLS:
+        icon = load_icon(name, CURSOR_INK)
+        ink.alpha_composite(icon, (4, 4))
+        alpha = icon.getchannel("A")
+        solid = [(x, y) for y in range(icon.height) for x in range(icon.width) if alpha.getpixel((x, y)) > 128]
+        if not solid:
+            raise ValueError(f"empty icon: {name}")
+        if name in TIP_TOOLS:
+            x, y = min(solid, key=lambda p: (p[0] - p[1], -p[1]))       # bottom-most-left pixel
+        else:
+            x0, y0, x1, y1 = alpha.getbbox()
+            x, y = (x0 + x1) // 2, (y0 + y1) // 2
+        hotspot = (4 + x, 4 + y)
+    else:
+        icon = load_icon(name, CURSOR_INK)
+        icon = icon.crop(icon.getchannel("A").getbbox() or (0, 0, 24, 24))   # the drawing, not its padding
+        scale = 19 / max(icon.size)
+        icon = icon.resize((max(1, round(icon.width * scale)), max(1, round(icon.height * scale))),
+                           Image.Resampling.LANCZOS)
+        ink.alpha_composite(icon, (11 + (19 - icon.width) // 2, 11 + (19 - icon.height) // 2))
+        draw = ImageDraw.Draw(ink)
+        draw.line((0, 4, 8, 4), fill=CURSOR_INK, width=1)
+        draw.line((4, 0, 4, 8), fill=CURSOR_INK, width=1)
+        hotspot = (4, 4)
+    outline = ink.getchannel("A").point(lambda v: 255 if v > 40 else 0).filter(ImageFilter.MaxFilter(3))
+    art = Image.new("RGBA", (size, size), (255, 255, 255, 0))
+    art.putalpha(outline)
+    art.alpha_composite(ink)
+    return art, hotspot
+
+
+def write_cursor(image: Image.Image, hotspot: Point, path: Path) -> None:
+    """Write a 32-bpp .cur (BGRA bitmap + AND mask), the layout Windows loads for a custom cursor."""
+    image = image.convert("RGBA")
+    width, height = image.size
+    pixels = image.load()
+    colour = bytearray()
+    for y in range(height - 1, -1, -1):
+        for x in range(width):
+            r, g, b, a = pixels[x, y]
+            colour += bytes((b, g, r, a))
+    row = ((width + 31) // 32) * 4
+    mask = bytearray()
+    for y in range(height - 1, -1, -1):
+        bits = bytearray(row)
+        for x in range(width):
+            if pixels[x, y][3] == 0:
+                bits[x // 8] |= 0x80 >> (x % 8)
+        mask += bits
+    header = struct.pack("<IiiHHIIiiII", 40, width, height * 2, 1, 32, 0, len(colour) + len(mask), 0, 0, 0, 0)
+    data = header + bytes(colour) + bytes(mask)
+    directory = struct.pack("<HHH", 0, 2, 1) + struct.pack(
+        "<BBBBHHII", width, height, 0, 0, hotspot[0], hotspot[1], len(data), 22)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(directory + data)
+    os.replace(tmp, path)
+
+
+def build_tool_cursors(names) -> dict[str, str]:
+    """One .cur per tool in a per-user temp folder; a tool whose cursor fails keeps the crosshair."""
+    folder = Path(tempfile.gettempdir()) / "clipchimp-cursors"
+    cursors = {}
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logging.warning("no cursor folder: %s", folder)
+        return cursors
+    for name in names:
+        try:
+            art, hotspot = cursor_art(name)
+            path = folder / f"{name}.cur"
+            write_cursor(art, hotspot, path)
+            cursors[name] = "@" + str(path).replace("\\", "/")   # Tcl reads backslashes as escapes
+        except Exception:
+            logging.exception("cursor for %s", name)
+    return cursors
+
+
 class FrameAnnotator:
     TOOL_NAMES = ("pen", "highlighter", "eraser", "rect", "ellipse",
                   "arrow", "line", "text", "crop")
@@ -494,7 +587,12 @@ class FrameAnnotator:
         self.owner = owner
         self.base = image.convert("RGBA")
         self.layer = Image.new("RGBA", self.base.size, (0, 0, 0, 0))
-        self.screen_rect = screen_rect
+        # The image is the source of truth; the frame shows it at `zoom` with its top-left at `origin`.
+        # `offset` = where the current image sits inside the original capture (moves with each crop).
+        self.origin: Point = (screen_rect[0], screen_rect[1])
+        self.zoom = 1.0
+        self.offset: Point = (0, 0)
+        self.moving = None
         self.outline = outline
         self.on_finish = on_finish
         self.on_cancel = on_cancel
@@ -503,7 +601,8 @@ class FrameAnnotator:
         self.automated = automated
         self.tool = "rect"
         self.color = "#ff3b30"
-        self.size = 2
+        self.sizes = {name: 8 if name == "eraser" else 2 for name in self.TOOL_NAMES}
+        self.cursors = build_tool_cursors(self.TOOL_NAMES)
         self.start: Point | None = None
         self.last: Point | None = None
         self.history: list[tuple[Image.Image, Image.Image, Rect]] = []
@@ -521,6 +620,11 @@ class FrameAnnotator:
         self.canvas.bind("<ButtonPress-1>", self.press)
         self.canvas.bind("<B1-Motion>", self.move)
         self.canvas.bind("<ButtonRelease-1>", self.release)
+        # the canvas only: a wheel event also reaches the Toplevel, which would zoom twice
+        self.canvas.bind("<MouseWheel>", self.wheel)
+        self.canvas.bind("<ButtonPress-3>", self.begin_frame_move)
+        self.canvas.bind("<B3-Motion>", self.frame_move)
+        self.canvas.bind("<ButtonRelease-3>", self.end_frame_move)
 
         self.toolbar = tk.Toplevel(owner)
         self.toolbar.overrideredirect(True)
@@ -535,6 +639,7 @@ class FrameAnnotator:
             window.bind("<Escape>", lambda _e: self.cancel())
             window.bind("<Control-z>", lambda _e: self.undo())
             window.bind("<Control-y>", lambda _e: self.redo())
+        self.set_cursor()
         self.place_all()
         self.refresh()
         self.frame.after_idle(self.take_focus)
@@ -593,10 +698,23 @@ class FrameAnnotator:
         for name, widget in self.icon_widgets.items():
             widget.configure(bg=self.theme["selected"] if name == self.tool else self.theme["button"])
 
+    @property
+    def size(self) -> int:
+        return self.sizes[self.tool]
+
     def choose_tool(self, name: str) -> None:
         self.tool = name
-        self.canvas.configure(cursor="xterm" if name == "text" else "crosshair")
+        self.size_var.set(self.sizes[name])     # each tool keeps its own size
+        self.set_cursor()
         self.update_selected()
+
+    def set_cursor(self) -> None:
+        """The pointer over the clip is the selected tool's icon (the crosshair if that cursor is missing)."""
+        try:
+            self.canvas.configure(cursor=self.cursors.get(self.tool, "crosshair"))
+        except tk.TclError:
+            logging.warning("cursor refused for %s", self.tool)
+            self.canvas.configure(cursor="crosshair")
 
     def choose_color(self) -> None:
         self.clickaway_control(True)
@@ -611,25 +729,33 @@ class FrameAnnotator:
             self.size_scale.configure(activebackground=self.color)
 
     def change_size(self, value) -> None:
-        self.size = int(float(value))
+        self.sizes[self.tool] = int(float(value))
+
+    def view_rect(self) -> Rect:
+        """Where the frame is on screen: the image at `zoom`, top-left at `origin`."""
+        width = max(1, round(self.base.width * self.zoom))
+        height = max(1, round(self.base.height * self.zoom))
+        return self.origin[0], self.origin[1], self.origin[0] + width, self.origin[1] + height
 
     def toolbar_rect(self) -> Rect:
         vx0, vy0, vx1, vy1 = virtual_screen()
         width, height = self.toolbar_size
-        center = (self.screen_rect[0] + self.screen_rect[2]) // 2
+        view = self.view_rect()
+        center = (view[0] + view[2]) // 2
         left = min(max(vx0, center - width // 2), vx1 - width)
-        if self.screen_rect[1] - height - 8 >= vy0:
-            top = self.screen_rect[1] - height - 8
+        if view[1] - height - 8 >= vy0:
+            top = view[1] - height - 8
         else:
-            top = min(vy1 - height, self.screen_rect[3] + 8)
+            top = min(vy1 - height, view[3] + 8)
         return left, top, left + width, top + height
 
     def place_all(self) -> None:
-        place_window(self.frame, self.screen_rect, activate=True)
+        view = self.view_rect()
+        place_window(self.frame, view, activate=True)
         toolbar_rect = self.toolbar_rect()
         place_window(self.toolbar, toolbar_rect)
-        self.outline.show(self.screen_rect)
-        self.regions_changed(self.screen_rect, toolbar_rect)
+        self.outline.show(view)
+        self.regions_changed(view, toolbar_rect)
 
     def take_focus(self) -> None:
         self.frame.lift()
@@ -637,7 +763,7 @@ class FrameAnnotator:
         self.frame.focus_force()
 
     def state(self):
-        return self.base.copy(), self.layer.copy(), self.screen_rect
+        return self.base.copy(), self.layer.copy(), self.offset
 
     def checkpoint(self) -> None:
         self.history.append(self.state())
@@ -645,32 +771,91 @@ class FrameAnnotator:
             self.history.pop(0)
         self.future.clear()
 
+    def restore(self, saved) -> None:
+        # Re-place relative to where the frame is NOW, so moving or zooming is never undone by accident.
+        base, layer, offset = saved
+        dx, dy = offset[0] - self.offset[0], offset[1] - self.offset[1]
+        self.origin = (self.origin[0] + round(dx * self.zoom), self.origin[1] + round(dy * self.zoom))
+        self.base, self.layer, self.offset = base, layer, offset
+        low, high = self.zoom_limits()
+        self.zoom = min(high, max(low, self.zoom))
+        self.place_all(); self.refresh()
+
     def undo(self) -> None:
         if self.history:
             self.future.append(self.state())
-            self.base, self.layer, self.screen_rect = self.history.pop()
-            self.place_all(); self.refresh()
+            self.restore(self.history.pop())
 
     def redo(self) -> None:
         if self.future:
             self.history.append(self.state())
-            self.base, self.layer, self.screen_rect = self.future.pop()
-            self.place_all(); self.refresh()
+            self.restore(self.future.pop())
 
     def composite(self) -> Image.Image:
         return Image.alpha_composite(self.base, self.layer)
 
     def refresh(self, temporary: Image.Image | None = None) -> None:
         shown = temporary or self.composite()
+        if self.zoom != 1.0:
+            size = (self.view_rect()[2] - self.origin[0], self.view_rect()[3] - self.origin[1])
+            # enlarged: every image pixel stays a crisp block; shrunk: smoothed
+            shown = shown.resize(size, Image.Resampling.NEAREST if self.zoom > 1 else Image.Resampling.BILINEAR)
         self.photo = ImageTk.PhotoImage(shown)
         self.canvas.configure(width=shown.width, height=shown.height)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
 
+    def to_image(self, event) -> Point:
+        """Canvas (screen) pixels → image pixels."""
+        return int(event.x / self.zoom), int(event.y / self.zoom)
+
     def point(self, event) -> Point | None:
-        if 0 <= event.x < self.base.width and 0 <= event.y < self.base.height:
-            return event.x, event.y
+        x, y = self.to_image(event)
+        if 0 <= event.x and 0 <= event.y and x < self.base.width and y < self.base.height:
+            return x, y
         return None
+
+    # ---------- zoom (wheel) and move (right button) ----------
+    def zoom_limits(self) -> tuple[float, float]:
+        width, height = self.base.size
+        high = min(ZOOM_MAX, math.sqrt(ZOOM_MAX_PIXELS / (width * height)))
+        low = max(ZOOM_MIN, ZOOM_MIN_SIDE / min(width, height))
+        return min(1.0, low), max(1.0, high)
+
+    def wheel(self, event) -> None:
+        if self.start or self.moving or not event.delta:
+            return
+        low, high = self.zoom_limits()
+        new = min(high, max(low, self.zoom * ZOOM_STEP ** (event.delta / 120)))
+        if abs(new - 1.0) < 1e-6:
+            new = 1.0
+        if abs(new - self.zoom) < 1e-9:
+            return
+        # the image pixel under the pointer stays under the pointer
+        ratio = new / self.zoom
+        self.origin = (round(self.origin[0] + event.x - event.x * ratio),
+                       round(self.origin[1] + event.y - event.y * ratio))
+        self.zoom = new
+        self.place_all(); self.refresh()
+
+    def begin_frame_move(self, event) -> None:
+        if self.start:
+            return
+        self.moving = (event.x_root, event.y_root, self.origin)
+        self.canvas.configure(cursor="fleur")
+
+    def frame_move(self, event) -> None:
+        if not self.moving:
+            return
+        x0, y0, (ox, oy) = self.moving
+        self.origin = (ox + event.x_root - x0, oy + event.y_root - y0)
+        self.place_all()
+
+    def end_frame_move(self, event) -> None:
+        if self.moving:
+            self.frame_move(event)
+            self.moving = None
+            self.set_cursor()
 
     def rgba(self, alpha: int = 255):
         value = self.color.lstrip("#")
@@ -678,7 +863,7 @@ class FrameAnnotator:
 
     def press(self, event) -> None:
         point = self.point(event)
-        if point is None:
+        if point is None or self.moving:
             return
         if self.tool == "text":
             self.clickaway_control(True)
@@ -712,17 +897,19 @@ class FrameAnnotator:
             self.refresh()
             return
         if point is None:
-            point = (min(self.base.width - 1, max(0, event.x)),
-                     min(self.base.height - 1, max(0, event.y)))
+            x, y = self.to_image(event)
+            point = (min(self.base.width - 1, max(0, x)), min(self.base.height - 1, max(0, y)))
         if self.tool in ("rect", "ellipse", "arrow", "line"):
             self.draw_shape(self.layer, self.tool, self.start, point)
         elif self.tool == "crop":
             x0, x1 = sorted((self.start[0], point[0])); y0, y1 = sorted((self.start[1], point[1]))
             if x1 - x0 >= 4 and y1 - y0 >= 4:
-                left, top = self.screen_rect[:2]
                 self.base = self.base.crop((x0, y0, x1, y1))
                 self.layer = self.layer.crop((x0, y0, x1, y1))
-                self.screen_rect = left + x0, top + y0, left + x1, top + y1
+                self.origin = (self.origin[0] + round(x0 * self.zoom), self.origin[1] + round(y0 * self.zoom))
+                self.offset = (self.offset[0] + x0, self.offset[1] + y0)
+                low, high = self.zoom_limits()
+                self.zoom = min(high, max(low, self.zoom))
                 self.place_all()
         self.start = self.last = None
         self.refresh()
