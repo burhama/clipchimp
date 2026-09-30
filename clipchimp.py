@@ -438,11 +438,23 @@ def windows_theme() -> dict[str, str]:
             light = bool(winreg.QueryValueEx(key, "AppsUseLightTheme")[0])
     except OSError:
         pass
-    if light:
-        return {"pill": "#f4f4f5", "button": "#f4f4f5", "hover": "#e4e4e7",
-                "selected": "#dbeafe", "icon": "#202124", "muted": "#71717a"}
-    return {"pill": "#202124", "button": "#202124", "hover": "#35363a",
-            "selected": "#174a72", "icon": "#f5f5f5", "muted": "#a1a1aa"}
+    return TOOLBAR_LIGHT if light else TOOLBAR_DARK
+
+
+# The toolbar ("Bold"): big 44 px buttons, heavy icons, the chosen tool a solid blue tile.
+TOOLBAR_DARK = {"bar": "#121418", "border": "#262930", "ink": "#f2f2f0", "hover": "#23262d",
+                "press": "#2c3038", "chosen": "#3d7bf2", "chosen_ink": "#ffffff", "divider": "#262930",
+                "ring": "#f2f2f0", "track": "#2c3038", "fill": "#3d7bf2", "knob": "#ffffff",
+                "knob_edge": "#121418"}
+TOOLBAR_LIGHT = {"bar": "#ffffff", "border": "#d9dbe0", "ink": "#15171b", "hover": "#eef0f3",
+                 "press": "#e3e6ea", "chosen": "#2f6ae6", "chosen_ink": "#ffffff", "divider": "#e3e5e9",
+                 "ring": "#15171b", "track": "#e3e6ea", "fill": "#2f6ae6", "knob": "#ffffff",
+                 "knob_edge": "#9ea3ab"}
+TOOLBAR_GROUPS = (("pen", "highlighter", "eraser"), ("rect", "ellipse", "arrow", "line"), ("text", "crop"),
+                  ("undo", "redo"), ("colour", "size"))
+TB_BUTTON, TB_GAP, TB_PAD, TB_GROUP_GAP = 44, 4, 8, 14     # button, gap inside a group, edge, gap between groups
+TB_RADIUS, TB_TILE_RADIUS, TB_ICON = 14, 10, 22
+TB_SWATCH, TB_SLIDER, TB_TRACK, TB_KNOB = 22, 90, 6, 16     # colour square; size slider length, track, knob
 
 
 def fallback_icon(name: str, colour: str) -> Image.Image:
@@ -475,17 +487,24 @@ def fallback_icon(name: str, colour: str) -> Image.Image:
     return image
 
 
-def load_icon(name: str, colour: str) -> Image.Image:
+_icon_cache: dict[tuple[str, str, int], Image.Image] = {}
+
+
+def load_icon(name: str, colour: str, size: int = 24) -> Image.Image:
+    key = (name, colour, size)
+    if key in _icon_cache:
+        return _icon_cache[key]
     path = Path(__file__).with_name("icons") / f"{name}.png"
     try:
-        source = Image.open(path).convert("RGBA").resize((24, 24), Image.Resampling.LANCZOS)
+        source = Image.open(path).convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
         alpha = source.getchannel("A")
         tinted = Image.new("RGBA", source.size, colour)
         tinted.putalpha(alpha)
-        return tinted
     except Exception:
         logging.warning("using fallback icon: %s", name)
-        return fallback_icon(name, colour)
+        tinted = fallback_icon(name, colour).resize((size, size), Image.Resampling.LANCZOS)
+    _icon_cache[key] = tinted
+    return tinted
 
 
 CURSOR_INK = "#1f2328"
@@ -608,8 +627,6 @@ class FrameAnnotator:
         self.history: list[tuple[Image.Image, Image.Image, Rect]] = []
         self.future: list[tuple[Image.Image, Image.Image, Rect]] = []
         self.photo = None
-        self.icon_photos: dict[str, ImageTk.PhotoImage] = {}
-        self.icon_widgets: dict[str, tk.Label] = {}
         self.theme = windows_theme()
 
         self.frame = tk.Toplevel(owner)
@@ -646,65 +663,137 @@ class FrameAnnotator:
         if automated:
             self.frame.after(350, self.automate)
 
+    # ---------- the toolbar: ONE drawn picture, hit-tested by position ----------
     def build_toolbar(self) -> None:
-        width, height = 11 * 36 + 44 + 104 + 16, 48
-        self.toolbar_size = (width, height)
-        self.toolbar_canvas.configure(width=width, height=height)
-        self.toolbar_canvas.create_polygon(
-            8, 0, width - 8, 0, width, 8, width, height - 8,
-            width - 8, height, 8, height, 0, height - 8, 0, 8,
-            fill=self.theme["pill"], smooth=True)
-        x = 8
-        for name in self.ALL_ICONS:
-            icon = ImageTk.PhotoImage(load_icon(name, self.theme["icon"]))
-            self.icon_photos[name] = icon
-            label = tk.Label(self.toolbar_canvas, image=icon, bg=self.theme["button"],
-                             bd=0, cursor="hand2", width=34, height=34)
-            action = self.undo if name == "undo" else self.redo if name == "redo" else lambda n=name: self.choose_tool(n)
-            label.bind("<Button-1>", lambda _e, fn=action: fn())
-            label.bind("<Enter>", lambda _e, n=name: self.hover(n, True))
-            label.bind("<Leave>", lambda _e, n=name: self.hover(n, False))
-            self.toolbar_canvas.create_window(x, 7, window=label, anchor="nw", width=36, height=34)
-            self.icon_widgets[name] = label
-            x += 36
-        self.color_image = ImageTk.PhotoImage(self.color_dot())
-        self.color_widget = tk.Label(self.toolbar_canvas, image=self.color_image,
-                                     bg=self.theme["button"], cursor="hand2", bd=0)
-        self.color_widget.bind("<Button-1>", lambda _e: self.choose_color())
-        self.toolbar_canvas.create_window(x + 3, 7, window=self.color_widget,
-                                          anchor="nw", width=36, height=34)
-        x += 44
-        self.size_var = tk.IntVar(value=self.size)
-        self.size_scale = tk.Scale(self.toolbar_canvas, from_=1, to=30, orient="horizontal",
-                                   variable=self.size_var, command=self.change_size,
-                                   length=92, showvalue=False, sliderlength=14, bd=0,
-                                   highlightthickness=0, troughcolor=self.theme["muted"],
-                                   bg=self.theme["pill"], activebackground=self.color)
-        self.toolbar_canvas.create_window(x, 10, window=self.size_scale,
-                                          anchor="nw", width=96, height=28)
-        self.update_selected()
+        items, dividers, pos = {}, [], TB_PAD
+        for index, group in enumerate(TOOLBAR_GROUPS):
+            for name in group:
+                length = TB_SLIDER if name == "size" else TB_BUTTON
+                items[name] = (pos, TB_PAD, pos + length, TB_PAD + TB_BUTTON)
+                pos += length + TB_GAP
+            pos -= TB_GAP
+            if index < len(TOOLBAR_GROUPS) - 1:
+                dividers.append(pos + TB_GROUP_GAP / 2)
+                pos += TB_GROUP_GAP
+        self.toolbar_items, self.toolbar_dividers = items, dividers    # rects are toolbar-local
+        self.toolbar_size = (pos + TB_PAD, TB_BUTTON + 2 * TB_PAD)
+        self.toolbar_canvas.configure(width=self.toolbar_size[0], height=self.toolbar_size[1])
+        self.tb_hover = self.tb_press = None
+        self.tb_drag = False
+        self.toolbar_photo = None
+        self.toolbar_image = self.toolbar_canvas.create_image(0, 0, anchor="nw")
+        self.toolbar_canvas.bind("<Motion>", self.toolbar_motion)
+        self.toolbar_canvas.bind("<Enter>", self.toolbar_motion)    # a pointer that jumps in lights its button too
+        self.toolbar_canvas.bind("<B1-Motion>", self.toolbar_motion)
+        self.toolbar_canvas.bind("<Leave>", self.toolbar_leave)
+        self.toolbar_canvas.bind("<ButtonPress-1>", self.toolbar_press)
+        self.toolbar_canvas.bind("<ButtonRelease-1>", self.toolbar_release)
+        self.draw_toolbar()
 
-    def color_dot(self) -> Image.Image:
-        icon = Image.new("RGBA", (24, 24), (0, 0, 0, 0))
-        ImageDraw.Draw(icon).ellipse((5, 5, 19, 19), fill=self.color,
-                                     outline=self.theme["icon"], width=1)
-        return icon
+    def toolbar_picture(self) -> Image.Image:
+        """The whole toolbar in its current state. Inside it is anti-aliased; its outer edge is hard,
+        because the corners around it are keyed out (TRANSPARENT_KEY) and a soft edge would fringe."""
+        theme, R = self.theme, 4
+        W, H = self.toolbar_size
+        img = Image.new("RGBA", (W * R, H * R), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img, "RGBA")
+        radius = min(TB_RADIUS, min(W, H) / 2)
+        d.rounded_rectangle((0, 0, W * R - 1, H * R - 1), radius * R, fill=theme["border"])
+        d.rounded_rectangle((R, R, W * R - 1 - R, H * R - 1 - R), (radius - 1) * R, fill=theme["bar"])
+        for p in self.toolbar_dividers:
+            d.rectangle((p * R - R // 2, (TB_PAD + TB_BUTTON * 0.24) * R, p * R + R // 2,
+                         (TB_PAD + TB_BUTTON * 0.76) * R), fill=theme["divider"])
+        for name, rect in self.toolbar_items.items():
+            x0, y0, x1, y1 = (c * R for c in rect)
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            chosen = name == self.tool
+            tile = theme["press"] if self.tb_press == name else theme["hover"] if self.tb_hover == name else None
+            if chosen:
+                tile = theme["press"] if self.tb_press == name else theme["chosen"]
+            if tile and name != "size":
+                d.rounded_rectangle((x0, y0, x1 - 1, y1 - 1), TB_TILE_RADIUS * R, fill=tile)
+            if name == "colour":
+                r = TB_SWATCH / 2 * R
+                d.rounded_rectangle((cx - r, cy - r, cx + r, cy + r), 6 * R, fill=self.color,
+                                    outline=theme["ring"], width=int(1.5 * R))
+            elif name == "size":
+                frac = (self.size - 1) / 29
+                t, k = TB_TRACK * R / 2, TB_KNOB * R / 2
+                a, b = x0 + 8 * R, x1 - 8 * R
+                kx = a + (b - a) * frac
+                d.rounded_rectangle((a, cy - t, b, cy + t), t, fill=theme["track"])
+                d.rounded_rectangle((a, cy - t, max(a + 2 * t, kx), cy + t), t, fill=theme["fill"])
+                k *= 1.15 if (self.tb_hover == "size" or self.tb_drag) else 1.0
+                d.ellipse((kx - k, cy - k, kx + k, cy + k), fill=theme["knob"],
+                          outline=theme["knob_edge"], width=int(1.25 * R))
+        img = img.resize((W, H), Image.Resampling.LANCZOS)
+        img.putalpha(img.getchannel("A").point(lambda a: 255 if a >= 128 else 0))
+        for name, (x0, y0, x1, y1) in self.toolbar_items.items():
+            if name in ("colour", "size"):
+                continue
+            ink = theme["chosen_ink"] if name == self.tool else theme["ink"]
+            icon = load_icon(name, ink, TB_ICON)
+            img.alpha_composite(icon, (int((x0 + x1 - icon.width) / 2), int((y0 + y1 - icon.height) / 2)))
+        return img
 
-    def hover(self, name: str, inside: bool) -> None:
-        bg = self.theme["selected"] if name == self.tool else self.theme["hover"] if inside else self.theme["button"]
-        self.icon_widgets[name].configure(bg=bg)
+    def draw_toolbar(self) -> None:
+        picture = Image.new("RGBA", self.toolbar_size, TRANSPARENT_KEY)
+        picture.alpha_composite(self.toolbar_picture())
+        self.toolbar_photo = ImageTk.PhotoImage(picture.convert("RGB"))
+        self.toolbar_canvas.itemconfigure(self.toolbar_image, image=self.toolbar_photo)
+
+    def toolbar_hit(self, x: int, y: int) -> str | None:
+        for name, (x0, y0, x1, y1) in self.toolbar_items.items():
+            if x0 <= x < x1 and y0 <= y < y1:
+                return name
+        return None
+
+    def set_size_from(self, x: int) -> None:
+        x0, _, x1, _ = self.toolbar_items["size"]
+        frac = min(1.0, max(0.0, (x - x0 - 8) / max(1, x1 - x0 - 16)))
+        self.sizes[self.tool] = int(round(1 + 29 * frac))
+
+    def toolbar_motion(self, event) -> None:
+        if self.tb_drag:
+            self.set_size_from(event.x); self.draw_toolbar(); return
+        hot = self.toolbar_hit(event.x, event.y)
+        if hot != self.tb_hover:
+            self.tb_hover = hot
+            self.toolbar_canvas.configure(cursor="hand2" if hot else "")
+            self.draw_toolbar()
+
+    def toolbar_leave(self, _event) -> None:
+        if not self.tb_drag and self.tb_hover:
+            self.tb_hover = None; self.draw_toolbar()
+
+    def toolbar_press(self, event) -> None:
+        name = self.toolbar_hit(event.x, event.y)
+        if not name:
+            return
+        self.tb_press = name
+        if name == "size":
+            self.tb_drag = True; self.set_size_from(event.x)
+        self.draw_toolbar()
+        if name == "undo": self.undo()
+        elif name == "redo": self.redo()
+        elif name == "colour":
+            self.choose_color()
+            self.tb_press = None; self.draw_toolbar()
+        elif name != "size": self.choose_tool(name)
+
+    def toolbar_release(self, _event) -> None:
+        self.tb_press, self.tb_drag = None, False
+        self.draw_toolbar()
 
     def update_selected(self) -> None:
-        for name, widget in self.icon_widgets.items():
-            widget.configure(bg=self.theme["selected"] if name == self.tool else self.theme["button"])
+        self.draw_toolbar()
 
     @property
     def size(self) -> int:
         return self.sizes[self.tool]
 
     def choose_tool(self, name: str) -> None:
-        self.tool = name
-        self.size_var.set(self.sizes[name])     # each tool keeps its own size
+        self.tool = name                         # each tool keeps its own size (self.sizes)
         self.set_cursor()
         self.update_selected()
 
@@ -724,12 +813,7 @@ class FrameAnnotator:
             self.clickaway_control(False)
         if picked:
             self.color = picked
-            self.color_image = ImageTk.PhotoImage(self.color_dot())
-            self.color_widget.configure(image=self.color_image)
-            self.size_scale.configure(activebackground=self.color)
-
-    def change_size(self, value) -> None:
-        self.sizes[self.tool] = int(float(value))
+            self.draw_toolbar()
 
     def view_rect(self) -> Rect:
         """Where the frame is on screen: the image at `zoom`, top-left at `origin`."""
