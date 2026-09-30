@@ -1,34 +1,34 @@
 # ClipChimp
 
-Snip. Edit. Save.
+Snip. Edit. Save. For Windows.
 
-For Windows.
+![ClipChimp and its toolbar](docs/hero.png)
 
 ## How to use
 
-### 1. Click the middle mouse button. Then quickly press it again and hold.
+### 1. Middle button: quick double click, then hold.
 
-![Step 1: click the middle button, then quickly press and hold](docs/step-1.png)
+![Step 1: quick double click the middle button, then hold it](docs/step-1.gif)
 
-### 2. Keep holding and drag over what you want. Let go.
+### 2. Drag over what you want. Let go.
 
-![Step 2: drag a box over what you want](docs/step-2.png)
+![Step 2: drag a box over what you want, then let go](docs/step-2.gif)
 
 ### 3. Draw.
 
-![Step 3: the toolbar: pen, marker, eraser, box, circle, arrow, line, text, crop, undo, redo, colour, size](docs/step-3.png)
+![Step 3: the toolbar: pen, marker, eraser, box, circle, arrow, line, text, crop, undo, redo, colour, size](docs/step-3.gif)
 
 ### 4. Scroll to zoom. Right-drag to move.
 
-![Step 4: scroll to make the snip bigger or smaller; hold the right button and drag to move it](docs/step-4.png)
+![Step 4: scroll to zoom the snip; hold the right button and drag to move it](docs/step-4.gif)
 
-### 5. The ring is what gets erased. Text follows you until you click.
+### 5. Erase. Type text, then click to drop it.
 
-![Step 5: a ring shows what the eraser takes; new text floats until you click or press Enter, and the arrow keys nudge it](docs/step-5.png)
+![Step 5: the ring shows what the eraser takes; text follows the pointer until you click, arrow keys nudge it](docs/step-5.gif)
 
-### 6. Click outside. It is saved in **Pictures › ClipChimp** and copied.
+### 6. Click outside. Saved in **Pictures › ClipChimp** and copied.
 
-![Step 6: click outside to save and copy](docs/step-6.png)
+![Step 6: click outside: saved and copied](docs/step-6.gif)
 
 **Esc** cancels.
 
