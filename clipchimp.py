@@ -628,6 +628,8 @@ class FrameAnnotator:
         self.future: list[tuple[Image.Image, Image.Image, Rect]] = []
         self.photo = None
         self.theme = windows_theme()
+        self.pointer: Point | None = None        # the image pixel under the pointer (for the eraser ring)
+        self.placing: dict | None = None         # a typed text still following the pointer, not yet dropped
 
         self.frame = tk.Toplevel(owner)
         self.frame.overrideredirect(True)
@@ -637,6 +639,8 @@ class FrameAnnotator:
         self.canvas.bind("<ButtonPress-1>", self.press)
         self.canvas.bind("<B1-Motion>", self.move)
         self.canvas.bind("<ButtonRelease-1>", self.release)
+        self.canvas.bind("<Motion>", self.hover)
+        self.canvas.bind("<Leave>", self.pointer_left)
         # the canvas only: a wheel event also reaches the Toplevel, which would zoom twice
         self.canvas.bind("<MouseWheel>", self.wheel)
         self.canvas.bind("<ButtonPress-3>", self.begin_frame_move)
@@ -653,9 +657,13 @@ class FrameAnnotator:
         self.toolbar_canvas.pack(fill="both", expand=True)
         self.build_toolbar()
         for window in (self.frame, self.toolbar):
-            window.bind("<Escape>", lambda _e: self.cancel())
+            window.bind("<Escape>", lambda _e: self.escape())
             window.bind("<Control-z>", lambda _e: self.undo())
             window.bind("<Control-y>", lambda _e: self.redo())
+            window.bind("<Return>", lambda _e: self.drop_text())
+            for key, (dx, dy) in {"Left": (-1, 0), "Right": (1, 0), "Up": (0, -1), "Down": (0, 1)}.items():
+                window.bind(f"<{key}>", lambda _e, d=(dx, dy): self.nudge_text(*d, 1))
+                window.bind(f"<Shift-{key}>", lambda _e, d=(dx, dy): self.nudge_text(*d, 10))
         self.set_cursor()
         self.place_all()
         self.refresh()
@@ -710,9 +718,11 @@ class FrameAnnotator:
             tile = theme["press"] if self.tb_press == name else theme["hover"] if self.tb_hover == name else None
             if chosen:
                 tile = theme["press"] if self.tb_press == name else theme["chosen"]
-            if tile and name != "size":
+            if tile and name != "size" and not self.toolbar_inert(name):
                 d.rounded_rectangle((x0, y0, x1 - 1, y1 - 1), TB_TILE_RADIUS * R, fill=tile)
-            if name == "colour":
+            if name == "colour" and self.toolbar_inert(name):
+                pass                                     # erasing: colour means nothing, the slot shows the eraser
+            elif name == "colour":
                 r = TB_SWATCH / 2 * R
                 d.rounded_rectangle((cx - r, cy - r, cx + r, cy + r), 6 * R, fill=self.color,
                                     outline=theme["ring"], width=int(1.5 * R))
@@ -729,10 +739,10 @@ class FrameAnnotator:
         img = img.resize((W, H), Image.Resampling.LANCZOS)
         img.putalpha(img.getchannel("A").point(lambda a: 255 if a >= 128 else 0))
         for name, (x0, y0, x1, y1) in self.toolbar_items.items():
-            if name in ("colour", "size"):
+            if name == "size" or (name == "colour" and not self.toolbar_inert(name)):
                 continue
             ink = theme["chosen_ink"] if name == self.tool else theme["ink"]
-            icon = load_icon(name, ink, TB_ICON)
+            icon = load_icon("eraser" if name == "colour" else name, ink, TB_ICON)
             img.alpha_composite(icon, (int((x0 + x1 - icon.width) / 2), int((y0 + y1 - icon.height) / 2)))
         return img
 
@@ -742,16 +752,21 @@ class FrameAnnotator:
         self.toolbar_photo = ImageTk.PhotoImage(picture.convert("RGB"))
         self.toolbar_canvas.itemconfigure(self.toolbar_image, image=self.toolbar_photo)
 
+    def toolbar_inert(self, name: str) -> bool:
+        """While erasing, the colour square shows the eraser and does nothing."""
+        return name == "colour" and self.tool == "eraser"
+
     def toolbar_hit(self, x: int, y: int) -> str | None:
         for name, (x0, y0, x1, y1) in self.toolbar_items.items():
             if x0 <= x < x1 and y0 <= y < y1:
-                return name
+                return None if self.toolbar_inert(name) else name
         return None
 
     def set_size_from(self, x: int) -> None:
         x0, _, x1, _ = self.toolbar_items["size"]
         frac = min(1.0, max(0.0, (x - x0 - 8) / max(1, x1 - x0 - 16)))
         self.sizes[self.tool] = int(round(1 + 29 * frac))
+        self.draw_overlays()                     # a floating text or the eraser ring follows the new size
 
     def toolbar_motion(self, event) -> None:
         if self.tb_drag:
@@ -793,9 +808,12 @@ class FrameAnnotator:
         return self.sizes[self.tool]
 
     def choose_tool(self, name: str) -> None:
+        if self.placing:
+            self.drop_text()                     # picking any tool drops the floating text where it is
         self.tool = name                         # each tool keeps its own size (self.sizes)
         self.set_cursor()
         self.update_selected()
+        self.draw_overlays()                     # the eraser ring shows only while the eraser is in hand
 
     def set_cursor(self) -> None:
         """The pointer over the clip is the selected tool's icon (the crosshair if that cursor is missing)."""
@@ -814,6 +832,7 @@ class FrameAnnotator:
         if picked:
             self.color = picked
             self.draw_toolbar()
+            self.draw_overlays()
 
     def view_rect(self) -> Rect:
         """Where the frame is on screen: the image at `zoom`, top-left at `origin`."""
@@ -866,12 +885,14 @@ class FrameAnnotator:
         self.place_all(); self.refresh()
 
     def undo(self) -> None:
+        if self.placing:                         # the floating text is not placed yet: undo just drops it
+            self.placing = None; self.refresh(); return
         if self.history:
             self.future.append(self.state())
             self.restore(self.history.pop())
 
     def redo(self) -> None:
-        if self.future:
+        if self.future and not self.placing:
             self.history.append(self.state())
             self.restore(self.future.pop())
 
@@ -888,6 +909,83 @@ class FrameAnnotator:
         self.canvas.configure(width=shown.width, height=shown.height)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
+        self.draw_overlays()
+
+    # ---------- overlays: the eraser ring and the floating text (canvas items, never in the image) ----------
+    def draw_overlays(self) -> None:
+        self.canvas.delete("overlay")
+        if self.placing:
+            self.draw_floating_text()
+        elif self.tool == "eraser" and self.pointer and not self.moving:
+            # exactly what one dab of the eraser clears: a circle 3 × size across (see draw_freehand)
+            r = max(1, self.size) * 1.5 * self.zoom
+            cx, cy = self.pointer[0] * self.zoom, self.pointer[1] * self.zoom
+            box = (cx - r, cy - r, cx + r, cy + r)
+            self.canvas.create_oval(*box, outline="#ffffff", width=3, tags="overlay")   # reads on dark pixels
+            self.canvas.create_oval(*box, outline=CURSOR_INK, width=1, tags="overlay")  # and on light ones
+
+    def draw_text(self, layer: Image.Image, point: Point, text: str) -> None:
+        ImageDraw.Draw(layer).text(point, text, fill=self.rgba(), font=self.get_font(max(12, self.size * 4)),
+                                   stroke_width=max(0, self.size // 5), stroke_fill=(0, 0, 0, 210))
+
+    def draw_floating_text(self) -> None:
+        p = self.placing
+        key = (p["text"], self.color, self.size, self.zoom)
+        if p.get("key") != key:                   # rebuild the picture only when its look changes
+            font, stroke = self.get_font(max(12, self.size * 4)), max(0, self.size // 5)
+            box = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox((0, 0), p["text"], font=font, stroke_width=stroke)
+            sprite = Image.new("RGBA", (max(1, box[2] - box[0]), max(1, box[3] - box[1])), (0, 0, 0, 0))
+            self.draw_text(sprite, (-box[0], -box[1]), p["text"])
+            if self.zoom != 1.0:
+                size = (max(1, round(sprite.width * self.zoom)), max(1, round(sprite.height * self.zoom)))
+                sprite = sprite.resize(size, Image.Resampling.NEAREST if self.zoom > 1 else Image.Resampling.BILINEAR)
+            p.update(key=key, box=box, photo=ImageTk.PhotoImage(sprite), size=sprite.size)
+        x = round((p["pos"][0] + p["box"][0]) * self.zoom)
+        y = round((p["pos"][1] + p["box"][1]) * self.zoom)
+        w, h = p["size"]
+        self.canvas.create_image(x, y, image=p["photo"], anchor="nw", tags="overlay")
+        # a thin dashed frame says "still moving": it follows the pointer until a click drops it
+        frame = (x - 4, y - 4, x + w + 3, y + h + 3)
+        self.canvas.create_rectangle(*frame, outline="#ffffff", width=1, tags="overlay")
+        self.canvas.create_rectangle(*frame, outline=TOOLBAR_DARK["chosen"], width=1, dash=(4, 3), tags="overlay")
+
+    def hover(self, event) -> None:
+        point = self.point(event)
+        if self.placing:
+            if point and point != self.placing["pos"]:
+                self.placing["pos"] = point; self.draw_overlays()
+            return
+        self.pointer = point
+        if self.tool == "eraser":
+            self.draw_overlays()
+
+    def pointer_left(self, _event) -> None:
+        self.pointer = None
+        if not self.placing:
+            self.draw_overlays()
+
+    # ---------- placing text: it follows the pointer; click (or Enter) drops it, arrows nudge, Esc drops it out ----------
+    def drop_text(self) -> None:
+        if not self.placing:
+            return
+        p, self.placing = self.placing, None
+        self.checkpoint()
+        self.draw_text(self.layer, p["pos"], p["text"])
+        self.refresh()
+
+    def nudge_text(self, dx: int, dy: int, step: int) -> None:
+        if not self.placing:
+            return
+        x, y = self.placing["pos"]
+        self.placing["pos"] = (min(self.base.width - 1, max(0, x + dx * step)),
+                               min(self.base.height - 1, max(0, y + dy * step)))
+        self.draw_overlays()
+
+    def escape(self) -> None:
+        if self.placing:
+            self.placing = None; self.refresh()          # only the floating text goes; the clip stays open
+        else:
+            self.cancel()
 
     def to_image(self, event) -> Point:
         """Canvas (screen) pixels → image pixels."""
@@ -947,7 +1045,14 @@ class FrameAnnotator:
 
     def press(self, event) -> None:
         point = self.point(event)
-        if point is None or self.moving:
+        if self.moving:
+            return
+        if self.placing:                         # the click that drops the floating text
+            if point:
+                self.placing["pos"] = point
+            self.drop_text()
+            return
+        if point is None:
             return
         if self.tool == "text":
             self.clickaway_control(True)
@@ -956,17 +1061,19 @@ class FrameAnnotator:
             finally:
                 self.clickaway_control(False)
             if text:
-                self.checkpoint()
-                ImageDraw.Draw(self.layer).text(point, text, fill=self.rgba(),
-                    font=self.get_font(max(12, self.size * 4)),
-                    stroke_width=max(0, self.size // 5), stroke_fill=(0, 0, 0, 210))
-                self.refresh()
+                self.placing = {"text": text, "pos": point}    # it now follows the pointer until dropped
+                self.frame.focus_force()                        # so Enter / arrows / Esc reach it
+                self.draw_overlays()
             return
         self.checkpoint()
         self.start = self.last = point
+        if self.tool == "eraser":                # a single click rubs out exactly the ring shown
+            self.draw_freehand(point, point); self.refresh()
 
     def move(self, event) -> None:
         point = self.point(event)
+        if point is not None:
+            self.pointer = point                 # the eraser ring rides along while rubbing out
         if not self.start or point is None:
             return
         if self.tool in ("pen", "highlighter", "eraser"):
@@ -1052,6 +1159,7 @@ class FrameAnnotator:
         self.frame.after(350, self.finish)
 
     def finish(self) -> None:
+        self.drop_text()                         # a floating text is saved where it floats, never lost
         self.on_finish(self.composite())
 
     def cancel(self) -> None:

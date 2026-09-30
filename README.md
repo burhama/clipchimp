@@ -1,6 +1,6 @@
 # ClipChimp
 
-It snips your screen. It saves it. It lets you edit a bit.
+Snip. Edit. Save.
 
 For Windows.
 
@@ -14,21 +14,23 @@ For Windows.
 
 ![Step 2: drag a box over what you want](docs/step-2.png)
 
-### 3. Draw on it if you want.
+### 3. Draw.
 
-![Step 3: draw on your snip](docs/step-3.png)
+![Step 3: the toolbar: pen, marker, eraser, box, circle, arrow, line, text, crop, undo, redo, colour, size](docs/step-3.png)
 
-Pen, marker, eraser, box, circle, arrow, line, text and crop. Undo and redo too.
+### 4. Scroll to zoom. Right-drag to move.
 
-Scroll to zoom. Right-drag to move it.
+![Step 4: scroll to make the snip bigger or smaller; hold the right button and drag to move it](docs/step-4.png)
 
-### 4. Click anywhere outside it.
+### 5. The ring is what gets erased. Text follows you until you click.
 
-![Step 4: click outside to save and copy](docs/step-4.png)
+![Step 5: a ring shows what the eraser takes; new text floats until you click or press Enter, and the arrow keys nudge it](docs/step-5.png)
 
-Done. It is saved in **Pictures › ClipChimp**. It is also copied, so you can paste it.
+### 6. Click outside. It is saved in **Pictures › ClipChimp** and copied.
 
-Changed your mind? Press **Esc**.
+![Step 6: click outside to save and copy](docs/step-6.png)
+
+**Esc** cancels.
 
 ## Install
 
