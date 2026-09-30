@@ -2,6 +2,8 @@
 
 Snip. Edit. Save. For Windows.
 
+Open source. A totally 100% unique clipping app that nobody has ever thought of.
+
 ![ClipChimp and its toolbar](docs/hero.png)
 
 ## How to use
