@@ -36,9 +36,6 @@ Source: "..\dist\ClipChimp\*"; DestDir: "{app}"; Flags: recursesubdirs ignorever
 Name: "{autoprograms}\ClipChimp"; Filename: "{sys}\schtasks.exe"; Parameters: "/Run /TN ""ClipChimp"""; \
   IconFilename: "{app}\ClipChimp.exe"; Flags: runminimized
 
-[Run]
-; the sign-in task is registered in [Code] (CurStepChanged), which stops with a message if it fails
-Filename: "{sys}\schtasks.exe"; Parameters: "/Run /TN ""ClipChimp"""; Flags: runhidden
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/IM ClipChimp.exe /F"; Flags: runhidden; RunOnceId: "StopClipChimp"
@@ -99,6 +96,9 @@ begin
     if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Command, '', SW_HIDE,
                 ewWaitUntilTerminated, Code) or (Code <> 0) then
       SuppressibleMsgBox('ClipChimp is installed, but it could not set itself to start with Windows (code ' +
-        IntToStr(Code) + '). Run this installer again.', mbError, MB_OK, IDOK);
+        IntToStr(Code) + '). Run this installer again.', mbError, MB_OK, IDOK)
+    else
+      { start it now, through the task (so it runs with the same rights it will have at every sign-in) }
+      Exec(ExpandConstant('{sys}\schtasks.exe'), '/Run /TN "ClipChimp"', '', SW_HIDE, ewWaitUntilTerminated, Code);
   end;
 end;
