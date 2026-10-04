@@ -1,8 +1,10 @@
 {
   ".github/workflows/privacy.yml": null,
+  ".github/workflows/release.yml": null,
   ".gitignore": null,
   "LICENSE": null,
   "README.md": null,
+  "clipchimp.ico": "c9b3027230363159e9635266e98f6e3272c9e716482d1f004875fea51b1df5b6",
   "clipchimp.py": null,
   "docs/hero.png": "d76c564d85c7bb7607ed18c69b902f76778a197121ca7f85bce2249c1ddde72b",
   "docs/step-1.gif": "72c29b16781c418699dcae299e7fdfcaba420fc146b2a49d8613baa6a7131697",
@@ -23,6 +25,7 @@
   "icons/text.png": "a23fdab8b1a899950c34cc53ae2aff77bf31fb2783f93b74b9b9c8dc2ec75c09",
   "icons/undo.png": "e7b54b2cb391b8cf2c4fc01137e66ce0c579471b8dbea1643b8269e96605b6a2",
   "install.ps1": null,
+  "installer/clipchimp.iss": null,
   "requirements.txt": null,
   "tools/check_privacy.py": null,
   "tools/manifest.json": null

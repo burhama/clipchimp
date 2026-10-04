@@ -1,0 +1,47 @@
+name: release
+
+# Builds the Windows installer on GitHub's machine (never on a contributor's PC) and attaches it to a release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  installer:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Privacy check
+        run: python tools/check_privacy.py
+      - name: Build
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt pyinstaller==6.20.0
+          python -m PyInstaller --noconfirm --onedir --windowed --name ClipChimp --icon clipchimp.ico --exclude-module numpy `
+            --add-data "icons;icons" --add-data "clipchimp.ico;." clipchimp.py
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y; }
+            $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6"
+          }
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          iscc /DAppVersion=$version installer\clipchimp.iss
+      - name: Privacy check of what will be published
+        run: python tools/check_privacy.py --binary dist
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          gh release create "${{ github.ref_name }}" "dist\ClipChimp-Setup-$version.exe" `
+            --title "ClipChimp $version" --notes "Download ClipChimp-Setup-$version.exe and run it."

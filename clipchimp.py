@@ -10,6 +10,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import queue
 import struct
 import tempfile
 import threading
@@ -19,8 +20,10 @@ import winreg
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageGrab, ImageTk
 import tkinter as tk
 from tkinter import colorchooser, simpledialog
+import win32api
 import win32clipboard
 import win32con
+import win32gui
 
 
 APP_NAME = "ClipChimp"
@@ -241,6 +244,7 @@ class HookThread(threading.Thread):
         self.frame_rect: Rect | None = None
         self.toolbar_rect: Rect | None = None
         self.timer: threading.Timer | None = None
+        self.paused = threading.Event()          # set from the tray: middle clicks pass straight through
         prototype = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
                                       wintypes.WPARAM, wintypes.LPARAM)
         self.callback_ref = prototype(self.callback)
@@ -296,7 +300,7 @@ class HookThread(threading.Thread):
                 self.drag_revision += 1
                 return user32.CallNextHookEx(self.hook, code, wparam, lparam)
             if wparam == WM_MBUTTONDOWN:
-                if self.annotation_active:
+                if self.annotation_active or self.paused.is_set():
                     return user32.CallNextHookEx(self.hook, code, wparam, lparam)
                 if self.first_down and now - self.first_down <= DOUBLE_CLICK_SECONDS:
                     if self.timer:
@@ -1169,6 +1173,127 @@ class FrameAnnotator:
         self.frame.destroy(); self.toolbar.destroy()
 
 
+def settings() -> dict:
+    """Per-user settings (optional): %APPDATA%\\ClipChimp\\settings.json, e.g. {"open": "<program or folder>"}."""
+    import json
+    path = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME / "settings.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logging.exception("could not read %s", path)
+        return {}
+
+
+def launch_as_user(target: str) -> None:
+    """Open a folder or start a program as the signed-in user, never as administrator: Explorer's own desktop
+    shell does the launch, so whatever opens gets Explorer's rights, not ClipChimp's."""
+    import pythoncom
+    import win32com.client
+    from win32com.client import VARIANT
+    pythoncom.CoInitialize()
+    try:
+        windows = win32com.client.dynamic.Dispatch("{9BA05972-F6A8-11CF-A442-00A0C90A8F39}")   # ShellWindows
+        desktop = windows.FindWindowSW(VARIANT(pythoncom.VT_I4, 0), VARIANT(pythoncom.VT_EMPTY, None), 8,
+                                       VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0), 1)
+        desktop.Document.Application.ShellExecute(target, "", "", "open", 1)
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def resource(name: str) -> Path:
+    return Path(__file__).with_name(name)
+
+
+class Tray(threading.Thread):
+    """The tray chimp. Left-click opens; right-click: Open · Pause clipping · Quit. Actions go to the Tk thread
+    through a queue (Tk is not thread-safe)."""
+    CALLBACK = win32con.WM_APP + 1
+    OPEN, PAUSE, QUIT = 1, 2, 3
+
+    def __init__(self, actions: "queue.Queue[str]", paused: threading.Event):
+        super().__init__(name="ClipChimpTray", daemon=True)
+        self.actions, self.paused = actions, paused
+        self.hwnd = 0
+        self.taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
+
+    def run(self) -> None:
+        try:
+            wc = win32gui.WNDCLASS()
+            wc.hInstance = win32api.GetModuleHandle(None)
+            wc.lpszClassName = "ClipChimpTray"
+            wc.lpfnWndProc = self.wndproc
+            win32gui.RegisterClass(wc)
+            self.hwnd = win32gui.CreateWindow(wc.lpszClassName, APP_NAME, 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None)
+            # Running as administrator, Windows filters the shell's messages to us unless we let them in.
+            for message in (self.CALLBACK, self.taskbar_created):
+                user32.ChangeWindowMessageFilterEx(self.hwnd, message, 1, None)
+            self.add()
+            win32gui.PumpMessages()
+        except Exception:
+            logging.exception("tray failed")
+
+    def icon(self):
+        size = user32.GetSystemMetrics(49)   # SM_CXSMICON, already scaled for this display
+        try:
+            return win32gui.LoadImage(0, str(resource("clipchimp.ico")), win32con.IMAGE_ICON, size, size,
+                                      win32con.LR_LOADFROMFILE)
+        except Exception:
+            logging.exception("tray icon missing")
+            return win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+
+    def add(self) -> None:
+        tip = APP_NAME + (" (paused)" if self.paused.is_set() else "")
+        win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, (self.hwnd, 0, win32gui.NIF_ICON | win32gui.NIF_MESSAGE |
+                                                     win32gui.NIF_TIP, self.CALLBACK, self.icon(), tip))
+
+    def refresh(self) -> None:
+        tip = APP_NAME + (" (paused)" if self.paused.is_set() else "")
+        win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, (self.hwnd, 0, win32gui.NIF_TIP, self.CALLBACK, 0, tip))
+
+    def menu(self) -> None:
+        m = win32gui.CreatePopupMenu()
+        win32gui.AppendMenu(m, win32con.MF_STRING, self.OPEN, "Open")
+        win32gui.AppendMenu(m, win32con.MF_STRING | (win32con.MF_CHECKED if self.paused.is_set() else 0),
+                            self.PAUSE, "Pause clipping")
+        win32gui.AppendMenu(m, win32con.MF_SEPARATOR, 0, "")
+        win32gui.AppendMenu(m, win32con.MF_STRING, self.QUIT, "Quit")
+        win32gui.SetMenuDefaultItem(m, self.OPEN, False)
+        win32gui.SetForegroundWindow(self.hwnd)
+        x, y = win32gui.GetCursorPos()
+        choice = win32gui.TrackPopupMenu(m, win32con.TPM_RETURNCMD | win32con.TPM_RIGHTBUTTON, x, y, 0, self.hwnd, None)
+        win32gui.PostMessage(self.hwnd, win32con.WM_NULL, 0, 0)
+        win32gui.DestroyMenu(m)
+        if choice == self.OPEN:
+            self.actions.put("open")
+        elif choice == self.PAUSE:
+            self.paused.clear() if self.paused.is_set() else self.paused.set()
+            self.refresh()
+        elif choice == self.QUIT:
+            self.actions.put("quit")
+
+    def wndproc(self, hwnd, message, wparam, lparam):
+        if message == self.CALLBACK:
+            if lparam == win32con.WM_LBUTTONUP:
+                self.actions.put("open")
+            elif lparam in (win32con.WM_RBUTTONUP, win32con.WM_CONTEXTMENU):
+                self.menu()
+            return 0
+        if message == self.taskbar_created:   # Explorer restarted: put the chimp back
+            self.add()
+            return 0
+        if message == win32con.WM_DESTROY:
+            win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (self.hwnd, 0))
+            win32gui.PostQuitMessage(0)
+            return 0
+        return win32gui.DefWindowProc(hwnd, message, wparam, lparam)
+
+    def stop(self) -> None:
+        if self.hwnd:
+            win32gui.PostMessage(self.hwnd, win32con.WM_CLOSE, 0, 0)
+
+
 class ClipChimpApp:
     def __init__(self, selftest_path: Path | None = None):
         self.root = tk.Tk()
@@ -1177,6 +1302,8 @@ class ClipChimpApp:
         self.selftest_path = selftest_path
         self.selftest = selftest_path is not None
         self.hook: HookThread | None = None
+        self.tray: Tray | None = None
+        self.actions: "queue.Queue[str]" = queue.Queue()
         self.outline = DottedOutline(self.root)
         self.annotator: FrameAnnotator | None = None
         self.last_drag_revision = -1
@@ -1184,11 +1311,19 @@ class ClipChimpApp:
         if self.selftest:
             self.root.after(100, self.begin_selftest)
         else:
-            self.hook = HookThread(); self.hook.start(); self.root.after(25, self.poll)
+            self.hook = HookThread(); self.hook.start()
+            self.tray = Tray(self.actions, self.hook.paused); self.tray.start()
+            self.root.after(25, self.poll)
 
     def poll(self) -> None:
         if self.hook.failure.is_set():
             self.report_error(RuntimeError("Could not install the global mouse hook")); self.root.destroy(); return
+        while not self.actions.empty():          # from the tray (its own thread)
+            action = self.actions.get_nowait()
+            if action == "quit":
+                self.root.destroy(); return
+            if action == "open":
+                self.open_clips()
         revision, anchor, current, dragging = self.hook.drag_snapshot()
         if revision != self.last_drag_revision:
             self.last_drag_revision = revision
@@ -1204,6 +1339,17 @@ class ClipChimpApp:
             self.hook.finalize_event.clear()
             if self.annotator: self.annotator.finish()
         self.root.after(25, self.poll)
+
+    def open_clips(self) -> None:
+        """The tray's Open: the clips folder, or the program/folder named by \"open\" in settings.json."""
+        target = settings().get("open")
+        try:
+            if not target:
+                clips_directory().mkdir(parents=True, exist_ok=True)
+                target = str(clips_directory())
+            launch_as_user(target)
+        except Exception as exc:
+            self.report_error(exc)
 
     def open_pending_region(self) -> None:
         rect, self.pending_rect = self.pending_rect, None
@@ -1273,6 +1419,7 @@ class ClipChimpApp:
         try: self.root.mainloop()
         finally:
             if self.hook: self.hook.stop()
+            if self.tray: self.tray.stop()
 
 
 def acquire_mutex():

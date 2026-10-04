@@ -36,17 +36,19 @@ Open source. A totally 100% unique clipping app that nobody has ever thought of.
 
 ## Install
 
-1. Get [Python 3](https://www.python.org/downloads/) for Windows.
-2. Download this page: green **Code** button, then **Download ZIP**. Unzip it.
-3. Right-click **install.ps1** and pick **Run with PowerShell**. On Windows 11, click **Show more options** first.
+Run **ClipChimp-Setup** from [Releases](../../releases/latest). Click **Yes** once.
 
-That's it. ClipChimp now waits quietly and starts with Windows.
+ClipChimp starts with Windows and waits in the tray. It runs as administrator, so it can snip any window.
 
-Keep the unzipped folder. ClipChimp runs from it.
+Click the tray chimp to open your snips. Right-click it to pause or quit.
+
+### From source
+
+Get [Python 3](https://www.python.org/downloads/). Download the ZIP and unzip it. Right-click **install.ps1** › **Run with PowerShell**. This way cannot snip administrator windows.
 
 ## Remove
 
-Press **Win + R**, type `shell:startup` and delete **ClipChimp**. Then restart your PC. Now you can delete the folder too.
+**Settings › Apps**, then uninstall **ClipChimp**. From source: press **Win + R**, type `shell:startup` and delete **ClipChimp**.
 
 ## License
 
