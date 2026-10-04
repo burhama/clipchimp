@@ -1,0 +1,21 @@
+name: privacy
+
+# Every push and pull request: the repository must hold exactly the files in tools/manifest.json, every picture
+# must match its pinned SHA-256 and carry no metadata, and no file or commit may hold a personal path, an email
+# address other than a GitHub noreply address, or a secret.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Privacy check
+        run: python3 tools/check_privacy.py --commits HEAD
