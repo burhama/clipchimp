@@ -15,6 +15,8 @@ DefaultDirName={autopf}\ClipChimp
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
+DisableWelcomePage=yes
+DisableFinishedPage=yes
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -35,8 +37,7 @@ Name: "{autoprograms}\ClipChimp"; Filename: "{sys}\schtasks.exe"; Parameters: "/
   IconFilename: "{app}\ClipChimp.exe"; Flags: runminimized
 
 [Run]
-Filename: "{sys}\schtasks.exe"; Parameters: "/Create /TN ""ClipChimp"" /XML ""{tmp}\clipchimp-task.xml"" /F"; \
-  Flags: runhidden; StatusMsg: "Starting ClipChimp with Windows..."
+; the sign-in task is registered in [Code] (CurStepChanged), which stops with a message if it fails
 Filename: "{sys}\schtasks.exe"; Parameters: "/Run /TN ""ClipChimp"""; Flags: runhidden
 
 [UninstallRun]
@@ -63,14 +64,16 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  User, Xml: String;
+  User, Xml, XmlPath, Command: String;
   Lines: TArrayOfString;
+  Code: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
     User := XmlEscape(GetEnv('USERDOMAIN') + '\' + GetUserNameString);
+    { no XML declaration: Task Scheduler's own reader only takes UTF-16 files, so the task is registered from the
+      text through PowerShell, which reads it as UTF-8 and handles any user name }
     Xml :=
-      '<?xml version="1.0" encoding="UTF-8"?>' + #13#10 +
       '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' +
       '<RegistrationInfo><Description>Starts ClipChimp at sign-in so it can clip over every window.</Description></RegistrationInfo>' +
       '<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>' + User + '</UserId></LogonTrigger></Triggers>' +
@@ -88,6 +91,14 @@ begin
       '</Task>';
     SetArrayLength(Lines, 1);
     Lines[0] := Xml;
-    SaveStringsToUTF8File(ExpandConstant('{tmp}\clipchimp-task.xml'), Lines, False);
+    XmlPath := ExpandConstant('{tmp}\clipchimp-task.xml');
+    SaveStringsToUTF8File(XmlPath, Lines, False);
+    StringChangeEx(XmlPath, '''', '''''', True);
+    Command := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Register-ScheduledTask -TaskName ' +
+      '''ClipChimp'' -Xml (Get-Content -Raw -Encoding UTF8 -LiteralPath ''' + XmlPath + ''') -Force -ErrorAction Stop | Out-Null"';
+    if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Command, '', SW_HIDE,
+                ewWaitUntilTerminated, Code) or (Code <> 0) then
+      SuppressibleMsgBox('ClipChimp is installed, but it could not set itself to start with Windows (code ' +
+        IntToStr(Code) + '). Run this installer again.', mbError, MB_OK, IDOK);
   end;
 end;
